@@ -1,0 +1,199 @@
+name: Terraform Module Version Checker
+
+on:
+#  push:
+#    branches:
+#      - main
+  workflow_dispatch:
+  #schedule:
+    ##- cron: '0 10 * * *'  # Every day at 7AM Argentina time
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+
+  # ===============================================
+  # JOB 1: Version Checker
+  # (1) Parse modules.plain
+  # (2) Query the Registry and compare versions
+  # (3) Save comparisons in version_report.md
+  # (4) Outdated modules go to module_issues.txt
+  # (5) Upload module_issues.txt as an Artifact
+  # ===============================================
+
+  check_versions:
+    runs-on: ubuntu-latest
+    outputs:
+      outdated: ${{ steps.check.outputs.outdated }}
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🛠️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+
+      - name: 🏗️ Generate module list
+        run: |
+          cd example/complete
+          terraform init -input=false -backend=false > /dev/null
+          terraform modules > modules.plain
+
+      - name: 🚀 Run version checker
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT_FILE="example/complete/modules.plain"
+          OUTPUT_FILE="version_report.md"
+          TMP_FILE=".modules_cleaned.tmp"
+          ISSUE_FILE="module_issues.txt"
+
+          if [[ ! -f "$INPUT_FILE" ]]; then
+            echo "❌ $INPUT_FILE does not exist. Aborting."
+            exit 1
+          fi
+
+          # ========== (1) Extract relevant fields: module_name, path, version ==========
+          sed -nE 's/.*"([^"]+)"\[([^]]+)\][[:space:]]+([0-9]+\.[0-9]+\.[0-9]+).*$/\1|\2|\3/p' "$INPUT_FILE" > "$TMP_FILE"
+
+          # ========== BEGIN version_report.md file ==========
+          echo "# 📦 Terraform Module Version Report" > "$OUTPUT_FILE"
+          echo "_Generated on $(date)_" >> "$OUTPUT_FILE"
+          echo "" >> "$OUTPUT_FILE"
+          touch "$ISSUE_FILE"
+
+          # ========== (2) VERSION QUERY and COMPARISON ==========
+          while IFS="|" read -r MODULE_NAME MODULE_PATH USED_VERSION; do
+            MODULE_NAME=$(echo "$MODULE_NAME" | sed 's/^module\.//; s/ *$//')
+            MODULE_PATH=$(echo "$MODULE_PATH" | xargs)
+            USED_VERSION=$(echo "$USED_VERSION" | xargs | sed 's/^[^0-9]*//')
+
+            if [[ -z "$MODULE_PATH" || "$MODULE_PATH" != registry.terraform.io/* ]]; then
+              continue
+            fi
+
+            # Extract namespace, name, and provider
+            MODULE_INFO=$(echo "$MODULE_PATH" | sed 's|^registry\.terraform\.io/||' | cut -d/ -f1-3)
+            IFS='/' read -r namespace name provider <<< "$MODULE_INFO"
+
+            if [[ -z "$namespace" || -z "$name" || -z "$provider" ]]; then
+              echo "⚠️ Malformed entry: $MODULE_PATH" | tee -a "$OUTPUT_FILE"
+              continue
+            fi
+
+            API_URL="https://registry.terraform.io/v1/modules/${namespace}/${name}/${provider}/versions"
+            RESPONSE=$(curl -s "$API_URL")
+
+            if [[ -z "$RESPONSE" || "$RESPONSE" == "null" ]]; then
+              echo "⚠️ Could not fetch latest version for \`${MODULE_PATH}\` (API error)" | tee -a "$OUTPUT_FILE"
+              continue
+            fi
+
+            LATEST_VERSION=$(echo "$RESPONSE" | jq -r '.modules[0].versions | map(.version) | sort_by(split(".") | map(tonumber)) | last')
+
+            if [[ -z "$LATEST_VERSION" || "$LATEST_VERSION" == "null" ]]; then
+              echo "⚠️ Could not determine latest version of \`${MODULE_PATH}\`" | tee -a "$OUTPUT_FILE"
+              continue
+            fi
+
+            # ========== (3) Write result to version_report.md ==========
+            if [[ "$USED_VERSION" == "$LATEST_VERSION" ]]; then
+              echo "✅ \`${MODULE_PATH}\` is up-to-date (**$USED_VERSION**)" | tee -a "$OUTPUT_FILE"
+            else
+              echo "❌ \`${MODULE_PATH}\` is outdated (used: **$USED_VERSION**, latest: **$LATEST_VERSION**)" | tee -a "$OUTPUT_FILE"
+              
+              # ========== (4) Save outdated module to module_issues.txt ==========
+              echo "${MODULE_NAME}|${namespace}/${name}/${provider}|${USED_VERSION}|${LATEST_VERSION}" >> "$ISSUE_FILE"
+            fi
+          done < "$TMP_FILE"
+
+          rm -f "$TMP_FILE"
+
+          # ========== Output to trigger the second job ==========
+          if [[ -s "$ISSUE_FILE" ]]; then
+            echo "outdated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "outdated=false" >> "$GITHUB_OUTPUT"
+          fi
+          
+      # ========== (5) Upload the generated files as artifacts ==========
+      - name: 📦 Upload artifacts
+        if: ${{ steps.check.outputs.outdated == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-version-check
+          path: module_issues.txt  
+
+  # ======================================================
+  # JOB 2: Issue Generator
+  # (1) Reads module_issues.txt generated by the previous job
+  # (2) For each module, checks if there's already an open issue
+  # (3) If it doesn't exist -> creates it
+  # (4) If it exists but is outdated -> updates it
+  # ======================================================
+
+  manage_issues:
+    needs: check_versions
+    if: needs.check_versions.outputs.outdated == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 📥 Download artifacts from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: module-version-check
+          path: module-version-check 
+
+      # Necessary: Ensure the 'terraform' label exists
+      - name: 🏷️ Ensure 'terraform' label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label list | grep -q '^terraform' || \
+          gh label create terraform --description "Terraform module related issues" --color 623CE4
+
+      - name: 🐛 Create or update issues for outdated modules
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+
+          # ========== (1) Iterate through each outdated module ==========
+          while IFS="|" read -r pattern module used latest; do
+            title="Upgrade(${pattern}): ${module} (${used} > ${latest})"
+
+            # ========== (2) Check if an issue already exists ==========
+            echo "🔍 Searching for existing issue for $pattern"
+            issue_data=$(gh issue list --state open --json title,number --jq \
+              '.[] | select(.title | startswith("Upgrade('"$pattern"'):"))')
+            
+            # ========== (3) If it doesn't exist, create the issue ==========
+            if [[ -z "$issue_data" ]]; then              
+              echo "🌟 Creating issue: $title"
+              gh issue create \
+                --title "$title" \
+                --body "The module \`${module}\` is outdated. - Pattern: \`${pattern}\` - Using: \`${used}\` - Latest version: \`${latest}\`" \
+                --label terraform
+            else
+              number=$(echo "$issue_data" | jq -r '.number')
+              old_title=$(echo "$issue_data" | jq -r '.title')
+
+              # ========== (4) If exists but outdated, update it ==========
+              if [[ "$old_title" != *"$latest"* ]]; then
+                echo "✏️ Updating issue #$number with new version"
+                gh issue edit "$number" \
+                  --title "$title" \
+                  --body "The module \`${module}\` is outdated. - Pattern: \`${pattern}\` - Using: \`${used}\` - Latest version: \`${latest}\`"
+              else
+                echo "✅ Issue already exists and is up-to-date for $pattern"
+              fi
+            fi
+          done < module-version-check/module_issues.txt 
